@@ -1,0 +1,329 @@
+% !TEX program = lualatex
+\documentclass[a4paper]{jlreq}
+\usepackage[haranoaji]{luatexja-preset}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage{xcolor}
+\usepackage[hidelinks,pdfusetitle]{hyperref}
+\usepackage{url}
+
+% ---- 検証済みパレット（dataviz 基準・印刷面ではダーク段を採用） ----
+\definecolor{segcol}{HTML}{C98500}   % 平均同類近傍率（黄・ダーク段）
+\definecolor{satcol}{HTML}{008300}   % 満足率（緑）
+\definecolor{grpA}{HTML}{2A78D6}     % グループA（青）
+\definecolor{grpB}{HTML}{1BAF7A}     % グループB（アクア）
+\definecolor{codebg}{HTML}{F5F4F0}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single, framerule=0.2pt, rulecolor=\color{black!25},
+  breaklines=true, columns=fullflexible, keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=1em, xrightmargin=1em,
+  aboveskip=1em, belowskip=1em
+}
+\renewcommand{\lstlistingname}{リスト}
+
+\title{アーティファクトを用いたシミュレーションモデルの作成\\
+  {\normalsize --- Claude Code によるブラウザ内シミュレーションの技術チュートリアル ---}}
+\author{河合勝彦\thanks{名古屋市立大学大学院経済学研究科　\texttt{kkawai@econ.nagoya-cu.ac.jp}}}
+\date{2026年7月12日}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本稿は，Claude Code の「アーティファクト」機能を用いて，ブラウザ内で完結するインタラクティブ・シミュレーションを構築するための技術チュートリアルである．まずアーティファクトの機能・発動条件・技術的制約を整理し，設計を支援する二つのスキル（\texttt{artifact-design}・\texttt{dataviz}）の役割を説明する．次に，制作過程の実例として，（1）連続時間の状態遷移と採点関数をもつ遊戯的シミュレータ「炭火職人」（うなぎ蒲焼きシミュレータ），（2）標準仕様のシェリング分居モデルのライブ実行環境，の二つを取り上げ，設計判断・実装・検証の全過程を示す．さらにシェリングモデルについては，アーティファクトと同一アルゴリズムの再現実行により得た分析結果（許容閾値 $\tau=0.3$ における分居の創発，$\tau$ と分居度の非線形関係，収束時間の急増）を報告する．
+\end{abstract}
+
+\tableofcontents
+
+\section{はじめに}
+
+エージェント・ベース・モデル（agent-based model; ABM）の研究・教育において，「モデルに触れられる」デモンストレーションの価値は大きい．パラメータを動かした瞬間にマクロな帰結が変わる体験は，数式やソースコードの静的な提示では代替できない．しかし従来，この種のデモを配布するには，NetLogo 環境の導入，Web サーバの運用，あるいは JavaScript フレームワークの学習といった準備コストが必要であった．
+
+Claude Code のアーティファクト（Artifact）機能は，この準備コストを大幅に引き下げる．対話的に仕様を伝えるだけで，自己完結した HTML アプリケーションが \texttt{claude.ai} 上の固定 URL に公開され，ブラウザさえあれば誰でも（共有設定後に）実行できる．本稿では，この機能を用いたシミュレーション構築の技術的要点を，実際の制作過程に即して解説する．
+
+本稿の構成は次のとおりである．第\ref{sec:artifact}節でアーティファクトの機能と制約を整理する．第\ref{sec:kabayaki}節では第一の事例として，連続時間の状態遷移をもつ遊戯的シミュレータの設計と実装を示す．第\ref{sec:schelling}節では第二の事例として，シェリング分居モデルの標準仕様による実装と，その分析結果を報告する．第\ref{sec:discussion}節で教育・研究上の含意と限界を論じる．
+
+\section{アーティファクトの機能と使い方}\label{sec:artifact}
+
+\subsection{アーティファクトとは}
+
+アーティファクトは，Claude が生成した HTML または Markdown ファイルを \texttt{claude.ai} 上の Web ページとしてレンダリングし，固定 URL で配信する仕組みである．重要な性質は以下のとおり．
+
+\begin{itemize}
+  \item \textbf{既定で非公開}\quad 公開直後は作成者本人のみが閲覧できる．他者との共有はページの共有メニューから作成者が明示的に行う．
+  \item \textbf{固定 URL と更新}\quad 同一ファイルパスから再公開すると同じ URL の内容が更新される．バージョンにはラベルを付与でき，履歴をたどれる．
+  \item \textbf{静的配信}\quad サーバサイドの計算資源は付かない．動的な挙動はすべてクライアント（閲覧者のブラウザ）の JavaScript が担う．
+\end{itemize}
+
+\subsection{発動条件と基本ワークフロー}
+
+アーティファクトは自動的に作られるものではなく，(a) 利用者が明示的に依頼した場合（「デモを作って」「Web ページにして」），(b) 端末のテキスト出力よりページとして見せる方が明らかに適切だと Claude が判断した場合に，ツール呼び出しとして発動する．シミュレーション構築の典型的なワークフローは次のとおりである．
+
+\begin{enumerate}
+  \item \textbf{仕様の対話的確定}\quad モデルの状態変数・更新規則・操作したいパラメータ・観察したい指標を自然言語で伝える．「標準的な仕様で」という指示も有効に機能する（第\ref{sec:schelling}節の事例）．
+  \item \textbf{デザインプランの提示}\quad Claude が配色・タイポグラフィ・レイアウトの計画を明示する（\texttt{artifact-design} スキル，後述）．
+  \item \textbf{実装}\quad 単一の HTML ファイルとして CSS・JavaScript を含めて書き下ろす．
+  \item \textbf{公開}\quad Artifact ツールで URL が発行される．修正依頼は同じ URL への再公開として反映される．
+\end{enumerate}
+
+\subsection{技術的制約}\label{sec:constraints}
+
+シミュレーション設計上，特に重要な制約は三つある．
+
+\begin{description}
+  \item[完全な自己完結（CSP）] 厳格な Content Security Policy により，外部ホストへの一切の通信（CDN のライブラリ，Web フォント，外部画像，\texttt{fetch}/XHR/WebSocket）が遮断される．したがって D3.js 等を使う場合はインライン化が必要であり，実務上は素の JavaScript と Canvas API で書くのが素直である．データも HTML 内に埋め込む．
+  \item[サーバサイド計算の不在] Python カーネルや NetLogo エンジンへの接続はできない．モデルは JavaScript へ移植してブラウザ内で実行するか，重い計算は事前に別環境で実行し，結果（軌道データ）を埋め込んだ「再生ビューア」として設計する．規模の目安として，Canvas 2D 描画で数千〜1万エージェント，WebGL の点描画に切り替えれば数十万エージェントまで実用的である．
+  \item[状態の非永続性] ページを再読み込みすると初期状態に戻る．再現性はシード付き乱数で担保する（第\ref{sec:schelling}節）．
+\end{description}
+
+このほか，閲覧者の OS 設定（ライト／ダークテーマ）に応じてページが表示されるため，配色は CSS カスタムプロパティ（トークン）として定義し，両テーマ分を用意するのが原則である（リスト\ref{lst:tokens}）．
+
+\begin{lstlisting}[caption={テーマ・トークンの定義パターン（抜粋）},label={lst:tokens}]
+:root{ --surface:#fcfcfb; --ink:#0b0b0b; --sA:#2a78d6; }
+@media (prefers-color-scheme: dark){
+  :root{ --surface:#1a1a19; --ink:#ffffff; --sA:#3987e5; }
+}
+:root[data-theme="light"]{ /* viewer toggle overrides */ }
+:root[data-theme="dark"]{  /* both directions          */ }
+\end{lstlisting}
+
+Canvas 描画はこのトークンを \texttt{getComputedStyle} で読み取り，テーマ切替イベント（\texttt{matchMedia} の変化と \texttt{data-theme} 属性の MutationObserver）で再描画する．
+
+\subsection{設計を支援する二つのスキル}
+
+制作品質は二つのスキル（Claude Code に読み込ませる指針書）に支えられている．
+
+\paragraph{artifact-design}
+ページ制作前に必ず読み込む設計指針である．依頼を「実用的な扱い」（文書・計画書）と「エディトリアルな扱い」（ランディングページ・ゲーム・共有されるツール）に読み分け，後者では定型的な出力（いわゆる AI 的デザイン）を避けて題材固有の視覚言語を構築することを要求する．コードを書く前に，配色（4〜6 色の名前付きパレット）・書体（役割別に 2 種以上）・レイアウト構想からなる「デザインプラン」を明示する手続きが定められている．
+
+\paragraph{dataviz}
+チャートを一つでも含む場合に読み込む作図規範である．特徴は「色は計算で検証する」という原則にあり，付属の検証スクリプトが (1) 明度帯域，(2) 彩度下限，(3) 色覚多様性（CVD）下での分離度（Machado 2009 シミュレーションによる $\Delta E$），(4) 背景とのコントラスト比を機械的に判定する．本稿の事例でも全系列色をこの検証に通した（第\ref{sec:palette}節）．このほか，二重軸の禁止，2 系列以上での凡例必置，データ色を文字に使わない，等の規則が定められている．
+
+\section{事例1：蒲焼きシミュレータ「炭火職人」}\label{sec:kabayaki}
+
+\subsection{題材とデザインプラン}
+
+第一の事例は，浜名湖うなぎの蒲焼きを炭火で焼き上げる遊戯的シミュレータである\footnote{公開 URL: \url{https://claude.ai/code/artifact/100b5bc4-c60e-42cd-9e19-f9277dbb6685}（既定で非公開）．}．「インタラクティブなデモ」という短い依頼から出発し，リポジトリの既存コンテンツ（浜名湖うなぎ紹介サイト）に題材を接地させた．遊戯的な題材だが，内部は連続時間の状態遷移モデルであり，ABM 的なシミュレータ構築の基本要素（状態変数・更新則・操作・評価関数・可視化）をすべて含む．
+
+デザインプランでは「夜の焼き場」という単一の視覚世界に振り切ることを選択し，例外規定（意図的な単一テーマ）を適用して墨色の地に熾火色をアクセントとするダークテーマのみで構成した．タイポグラフィは見出し・引用に明朝，UI にゴシック，格言「串打ち三年，裂き八年，焼き一生」を縦書き（\texttt{writing-mode: vertical-rl}）で配置している．
+
+\subsection{モデル：状態変数と更新則}
+
+プレイヤーが操作するのは「団扇であおぐ」「裏返す」「タレにくぐらせる」「仕上げる」の 4 ボタンのみである．内部状態は火力 $h(t) \in [30,100]$，両面の焼き加減 $D_i(t)$（$i \in \{\text{身側},\text{皮側}\}$），焦げ量 $C_i(t)$，タレ回数 $n$，タレ湿潤の残り時間 $w(t)$ である．更新則は毎フレーム（時間刻み $\Delta t$）：
+
+\begin{align}
+  \frac{dh}{dt} &= \kappa\,(h^{*} - h), & \kappa &= 0.055,\ h^{*} = 46
+  \label{eq:heat}\\
+  \frac{dD_{d}}{dt} &= \rho(h)\,\beta(w), &
+  \rho(h) &= 13\cdot\frac{h-30}{70},\quad
+  \beta(w) = \begin{cases}1.25 & (w>0)\\ 1 & (w \le 0)\end{cases}
+  \label{eq:cook}\\
+  \frac{dC_{d}}{dt} &= 0.85\,\rho(h)\,\mathbf{1}[D_{d} > 100]
+  \label{eq:char}
+\end{align}
+
+ここで $d$ は炭側（下）を向いている面を表し，「裏返す」操作が $d$ を切り替える．「団扇」は $h \leftarrow \min(100,\,h+16)$ の離散ジャンプである．式\eqref{eq:heat}の時定数は約 18 秒であり，放置すれば火力は熾火の平衡値 46 に緩和する．プレイヤーは団扇による離散介入で $h$ を管理し，式\eqref{eq:cook}の焼成速度を制御する——これが本作の中核的なトレードオフ（高火力は速いが式\eqref{eq:char}の焦げリスクを増す）を生む．
+
+タレは両面が白焼き基準（$D_i \ge 50$）に達するまで解禁されないフェーズゲートをもち，「仕上げる」で評価関数
+\begin{equation}
+  S = 100 - \sum_i b(D_i) - 1.2\sum_i C_i - P(n),\qquad
+  b(D) = 0.9\,(70-D)_{+} + 0.8\,(D-95)_{+}
+\end{equation}
+が計算される（$(x)_{+} = \max(x,0)$）．$P(n)$ はタレ回数のペナルティで $n=2,3$ を最適とする．焼き加減の理想帯 $[70,95]$・焦げ係数・タレ最適回数という 3 つの評価軸が互いに緊張関係にあるため，単調な攻略法が存在しない．
+
+\subsection{実装のポイント}
+
+描画は Canvas 2D で行い，\texttt{requestAnimationFrame} ループ内で状態更新と描画を分離した．熾火の明滅は決定的擬似乱数と正弦波の合成，煙・炎は簡易パーティクル系（生成率を $h$ と $w$ に比例させる）で表現している．タレが炭に落ちて炎が上がる演出は，実際の蒲焼きの物理に対応した「モデルに正直な」エフェクトである．アクセシビリティとして \texttt{prefers-reduced-motion} 設定時はパーティクルを停止し，効果音（WebAudio でバンドパスした白色雑音，音量は $h$ に追従）は既定オフのトグルとした．
+
+\section{事例2：シェリング分居モデル}\label{sec:schelling}
+
+\subsection{モデル仕様}
+
+第二の事例は Schelling (1971) の分居モデルの標準仕様によるライブ実行環境である\footnote{公開 URL: \url{https://claude.ai/code/artifact/9ac47541-7715-48f8-9513-39ef5e4c9772}（既定で非公開）．}．依頼は「モデル仕様は標準的なもので」であり，実装した仕様は次のとおり．
+
+\begin{itemize}
+  \item $L \times L$ 正方格子，周期境界（トーラス），ムーア近傍（8 近傍）．
+  \item 2 グループのエージェント．全セルから空き地率 $v$ 分を除き，指定比率で配分してランダム配置．
+  \item 満足条件：占有近傍セルに占める同類の割合が許容閾値 $\tau$ 以上（占有近傍が 0 の場合は満足）．
+  \item 更新規則：各ステップ開始時に不満エージェントを全列挙し，ランダム順に，一様ランダムに選んだ空き地へ逐次移動（非同期更新）．
+  \item 停止条件：不満エージェントが 0 になった時点で収束．
+\end{itemize}
+
+マクロ指標は，平均同類近傍率 $\bar{s}$（占有近傍を 1 以上もつエージェントの同類割合の平均；分居の程度）と満足率である．UI では $\tau$ と実行速度を実行中に変更でき，格子サイズ（$20 \le L \le 120$）・空き地率・グループ比・乱数シードは変更時に即時再初期化される．
+
+\subsection{実装}
+
+再現性の要は，シード付き乱数生成器 mulberry32 である（リスト\ref{lst:rng}）．初期配置のシャッフルと移動先の選択がすべてこの生成器を通るため，同じシードと設定なら同じ軌道が完全に再現される．
+
+\begin{lstlisting}[caption={シード付き乱数生成器 mulberry32},label={lst:rng}]
+function mulberry32(seed){
+  var a = seed >>> 0;
+  return function(){
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+\end{lstlisting}
+
+1 ステップ（スイープ）の中核はリスト\ref{lst:sweep}のとおり．空き地リストに対する「選んだ空き地を移動元セルで置き換える」スワップ操作により，空き地の一様抽選を $O(1)$ で維持している．格子は \texttt{Int8Array}，近傍はトーラス上のオフセットを事前計算した \texttt{Int32Array} で保持し，$L=120$（14{,}400 セル）でも毎秒 60 ステップの実行が可能である．
+
+\begin{lstlisting}[caption={スイープ（1ステップ）の中核部},label={lst:sweep}]
+// enumerate unsatisfied agents at sweep start, shuffle,
+// then move each to a uniformly random vacant cell
+var moves = 0;
+for(var m = 0; m < unsatList.length; m++){
+  if(vacant.length === 0) break;
+  var from = unsatList[m];
+  var vi = (rng() * vacant.length) | 0;
+  var to = vacant[vi];
+  vacant[vi] = from;   // vacated cell replaces the chosen vacancy
+  grid[to] = grid[from]; grid[from] = 0;
+  moves++;
+}
+\end{lstlisting}
+
+\subsection{可視化設計とパレット検証}\label{sec:palette}
+
+可視化は \texttt{dataviz} スキルの手順に従った．エンティティごとに固定順で色を割り当て（グループ A = 青，グループ B = アクア，平均同類近傍率 = 黄，満足率 = 緑；空き地はデータでないため無彩色），全系列を検証スクリプトにかけた．結果の要点：
+
+\begin{itemize}
+  \item 格子の 2 色（青・アクア）：CVD 分離 $\Delta E = 73.6$（ライト面）／$69.8$（ダーク面）で，目標値 12 を大きく上回り合格．
+  \item チャートの 2 色（黄・緑）：ライト面で黄のコントラスト比 2.11（3:1 未満の警告）→ 救済条件として凡例への現在値常時表示・ツールチップ・ステータスタイルを設置．ダーク面で $\Delta E = 10.3$（下限帯 8--12）→ 直接ラベルの併設により許容．
+\end{itemize}
+
+「警告は救済条件（可視ラベル等の第二の情報チャネル）とセットでのみ許容される」という規範が，機械判定によって強制される点が本手法の特長である．このほか，2 指標はいずれも割合（0--1）であるため単一の縦軸（0--100\%）を共有させ，二重軸を回避した．時系列チャートにはクロスヘア付きツールチップを実装し，全履歴を CSV としてクリップボードに出力するボタンを設けて外部解析への接続点とした．
+
+\subsection{分析結果}\label{sec:analysis}
+
+以下の数値は，アーティファクトと同一のアルゴリズム・同一の乱数生成器を Node.js で再現実行して得たものであり，アーティファクト上でも同じシードを入力すれば同じ軌道が観察できる．
+
+\paragraph{基準実行}
+$L=50$，$v=0.10$，グループ比 50:50，$\tau=0.30$，シード 42 の基準実行では，初期配置の平均同類近傍率は $\bar{s}_0 = 0.494$（ランダム混住の理論値 0.5 と整合）で，初期満足率はすでに 82.7\%である．すなわち大多数のエージェントは初期状態に満足している．それにもかかわらず，わずか 14 ステップ（延べ 1{,}003 回の移動）で全員満足に収束し，最終的な平均同類近傍率は $\bar{s} = 0.741$ に達した（図\ref{fig:traj}）．「同類が 3 割いれば満足」という穏やかな個人選好が，74\%という強い集団的分居を生む——シェリングが示した創発の核心が，そのまま再現されている．
+
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.85\linewidth, height=6.2cm,
+  xlabel={ステップ}, ylabel={割合},
+  xmin=0, xmax=14, ymin=0.4, ymax=1.02,
+  ytick={0.4,0.5,0.6,0.7,0.8,0.9,1.0},
+  yticklabel={\pgfmathprintnumber[fixed,precision=1]{\tick}},
+  grid=major, grid style={black!12},
+  axis line style={black!40},
+  legend pos=south east, legend style={draw=black!25, font=\small},
+  tick label style={font=\small}, label style={font=\small}
+]
+\addplot[segcol, thick, mark=*, mark size=1.6pt] coordinates {
+  (0,0.4942) (1,0.5868) (2,0.6399) (3,0.6679) (4,0.6908) (5,0.7097)
+  (6,0.7182) (7,0.7264) (8,0.7321) (9,0.7363) (10,0.7392) (12,0.7403) (14,0.7409)
+};
+\addlegendentry{平均同類近傍率 $\bar{s}$}
+\addplot[satcol, thick, mark=square*, mark size=1.5pt] coordinates {
+  (0,0.8271) (1,0.9071) (2,0.9404) (3,0.9600) (4,0.9716) (5,0.9822)
+  (6,0.9858) (7,0.9911) (8,0.9951) (9,0.9969) (10,0.9987) (12,0.9996) (14,1.0000)
+};
+\addlegendentry{満足率}
+\end{axis}
+\end{tikzpicture}
+\caption{基準実行の軌道（$L=50$，$v=0.10$，50:50，$\tau=0.30$，シード 42）．14 ステップで収束し，平均同類近傍率は 0.494 から 0.741 へ上昇する．}
+\label{fig:traj}
+\end{figure}
+
+\paragraph{許容閾値のスイープ}
+$\tau$ を変化させ，各 10 シード（1--10）・上限 3{,}000 ステップで実行した結果を表\ref{tab:sweep}と図\ref{fig:sweep}に示す．
+
+\begin{table}[tbp]
+\centering
+\caption{許容閾値 $\tau$ のスイープ（$L=50$，$v=0.10$，50:50，シード 1--10，上限 3{,}000 ステップ）}
+\label{tab:sweep}
+\begin{tabular}{ccccc}
+\toprule
+$\tau$ & 最終 $\bar{s}$（平均） & 標準偏差 & 平均収束ステップ & 収束数 \\
+\midrule
+0.10 & 0.511 & 0.006 & 1.4 & 10/10 \\
+0.20 & 0.576 & 0.014 & 6.4 & 10/10 \\
+0.25 & 0.581 & 0.015 & 6.2 & 10/10 \\
+0.30 & 0.750 & 0.011 & 12.6 & 10/10 \\
+0.40 & 0.826 & 0.010 & 16.1 & 10/10 \\
+0.50 & 0.867 & 0.006 & 17.4 & 10/10 \\
+0.60 & 0.974 & 0.001 & 131.0 & 10/10 \\
+0.70 & 0.995 & 0.001 & 207.6 & 10/10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.85\linewidth, height=6.2cm,
+  xlabel={許容閾値 $\tau$}, ylabel={最終 $\bar{s}$（10 シード平均）},
+  xmin=0.05, xmax=0.75, ymin=0.45, ymax=1.02,
+  grid=major, grid style={black!12},
+  axis line style={black!40},
+  tick label style={font=\small}, label style={font=\small}
+]
+\addplot[segcol, thick, mark=*, mark size=2pt] coordinates {
+  (0.10,0.5114) (0.20,0.5762) (0.25,0.5805) (0.30,0.7495)
+  (0.40,0.8259) (0.50,0.8670) (0.60,0.9743) (0.70,0.9950)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{許容閾値 $\tau$ と最終的な平均同類近傍率の関係．$\tau=0.25 \to 0.30$ で不連続に跳躍する．}
+\label{fig:sweep}
+\end{figure}
+
+三つの特徴が読み取れる．第一に，$\tau$ と分居度の関係は単調だが強く非線形であり，特に $\tau = 0.25 \to 0.30$ で $\bar{s}$ が $0.58$ から $0.75$ へ不連続に跳躍する．これはムーア近傍の離散性による．占有近傍が 8 のとき，満足に必要な同類数は $\lceil 8\tau \rceil$ であり，$\tau=0.25$ では 2 人，$\tau=0.30$ では 3 人と，実効閾値が整数単位で切り替わるためである．連続パラメータの背後にある離散構造が集計量に現れる好例であり，講義での議論素材に適する．
+
+第二に，$\tau=0.10$ では $\bar{s} = 0.511$ と初期値からほとんど動かない．不満者が僅少のため 1--2 ステップで収束し，分居はほぼ生じない．創発的分居には「穏やかだがゼロではない」選好水準が必要であることがわかる．
+
+第三に，$\tau \ge 0.60$ の高選好域では，最終分居度が 0.97 を超えて飽和する一方，収束までの平均ステップ数が 131（$\tau=0.6$），208（$\tau=0.7$）と一桁以上増大する．要求水準が高いほど「引っ越しの連鎖」が長く続き，ほぼ完全な棲み分け（少数の巨大クラスタ）に達してようやく停止する．なお空き地率 10\%の本設定では上限 3{,}000 ステップ内に全 run が収束したが，$\tau$ をさらに上げれば非収束（永続的な churning）に転じることが知られている．
+
+\subsection{再現性の担保}
+
+以上の分析はすべて，(1) シード付き乱数による軌道の完全な決定性，(2) アーティファクトの CSV 出力（\texttt{step, mean\_like\_neighbor\_frac, satisfied\_frac, moves}），の二点によって，アーティファクト上でもオフライン解析でも同一に再現できる.この「ブラウザ内のデモが同時に再現可能な計算実験装置でもある」という性質は，教材と研究ツールの距離を縮めるものである．
+
+\section{議論}\label{sec:discussion}
+
+\subsection{教育・研究上の含意}
+
+本稿の二事例が示すように，アーティファクトによるシミュレーション構築は (1) 配布コストが URL 一つ，(2) 実行環境がブラウザのみ，(3) シードによる再現性，という三点で教育利用に適する．講義では受講者が各自のデバイスでパラメータを操作でき，演習ではCSV 出力を起点に統計解析へ接続できる．研究面では，モデルの挙動を共同研究者に伝える「動く補足資料」としての利用が現実的である．
+
+\subsection{限界と対処}
+
+第\ref{sec:constraints}節の制約から，大規模計算（数十万エージェント超，長期 run，広いパラメータスイープ）には向かない．この場合は，計算を Python（Mesa 等）や Julia で別途実行し，軌道データを埋め込んだ再生ビューアとしてアーティファクトを設計する二段構成が有効である．スイープ結果のヒートマップから特定 run の再生に遷移する構成も同じ枠組みで実現できる．また，アーティファクトは既定で非公開であり，共有には作成者の明示的な操作が必要である点，および外部データの動的取得ができない点には留意されたい．
+
+\section{おわりに}
+
+本稿では，Claude Code のアーティファクト機能によるシミュレーション構築を，機能解説と二つの実例（連続時間の遊戯的シミュレータ，標準仕様のシェリング分居モデル）を通じて示した．とりわけ後者では，対話による仕様確定から，検証スクリプトに裏付けられた可視化設計，シード付き乱数による再現可能な分析までの全過程が，単一の HTML ファイルと URL に収まることを確認した．ABM の教育・研究における「触れるモデル」の敷居は，確実に下がっている．
+
+\appendix
+
+\section{公開アーティファクト一覧}
+
+\begin{itemize}
+  \item 炭火職人（うなぎ蒲焼きシミュレータ）\\
+    \url{https://claude.ai/code/artifact/100b5bc4-c60e-42cd-9e19-f9277dbb6685}
+  \item シェリング分居モデル（ライブ ABM）\\
+    \url{https://claude.ai/code/artifact/9ac47541-7715-48f8-9513-39ef5e4c9772}
+\end{itemize}
+
+いずれも既定で非公開であり，閲覧には作成者による共有操作が必要である．
+
+\begin{thebibliography}{9}
+\bibitem{schelling1971}
+Schelling, T.~C. (1971) ``Dynamic Models of Segregation,''
+\textit{Journal of Mathematical Sociology}, 1(2), 143--186.
+\end{thebibliography}
+
+\end{document}
